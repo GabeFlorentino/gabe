@@ -1,0 +1,94 @@
+-- ===========================
+-- SHEETS-SAFE: filtro /checkout 30d + sequência 30d (com LIMIT 1000 no resultado final)
+-- ===========================
+
+WITH
+anon_map AS (
+  SELECT anonymous_id, user_id
+  FROM (
+    SELECT
+      p.anonymous_id,
+      p.user_id,
+      p.original_timestamp AS map_ts
+    FROM `infinitepay-production.rudderstack_dw.pages` p
+    WHERE p.original_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+      AND p.anonymous_id IS NOT NULL
+      AND p.user_id IS NOT NULL
+
+    UNION ALL
+
+    SELECT
+      pu.anonymous_id,
+      pu.user_id,
+      pu.original_timestamp AS map_ts
+    FROM `infinitepay-production.rudderstack_dw.product_purchased` pu
+    WHERE pu.original_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+      AND pu.anonymous_id IS NOT NULL
+      AND pu.user_id IS NOT NULL
+  )
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY anonymous_id ORDER BY map_ts DESC) = 1
+),
+pages_30d AS (
+  SELECT
+    COALESCE(p.user_id, am.user_id) AS user_id,
+    p.path,
+    p.original_timestamp           AS page_ts
+  FROM `infinitepay-production.rudderstack_dw.pages` p
+  LEFT JOIN anon_map am
+    ON am.anonymous_id = p.anonymous_id
+  WHERE p.original_timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+),
+-- >>> apenas usuários que tocaram /checkout em até 30d
+users_checkout_30d AS (
+  SELECT DISTINCT user_id
+  FROM pages_30d
+  WHERE user_id IS NOT NULL
+    AND REGEXP_CONTAINS(path, r'(?i)(^|/)checkout([/?#]|$)')
+),
+pages_for_output AS (
+  SELECT p.*
+  FROM pages_30d p
+  JOIN users_checkout_30d u
+    ON u.user_id = p.user_id
+),
+agg AS (
+  SELECT
+    user_id,
+    ARRAY_AGG(
+      CONCAT(
+        path, ' @ ',
+        FORMAT_TIMESTAMP('%Y-%m-%d %H:%M:%S', page_ts, 'America/Sao_Paulo')
+      )
+      ORDER BY page_ts, path
+      LIMIT 1000
+    ) AS events_limited,
+    COUNT(*) AS touch_count_30d,
+    COUNTIF(REGEXP_CONTAINS(path, r'(?i)/(checkout/)?sucesso([/?#]|$)')) > 0 AS has_checkout_success,
+    COUNTIF(REGEXP_CONTAINS(path, r'(?i)(^|/)blog([/?#]|$)')) > 0             AS has_blog
+  FROM pages_for_output
+  GROUP BY user_id
+),
+seq AS (
+  SELECT
+    user_id,
+    ARRAY_TO_STRING(events_limited, ' > ') AS seq_raw,
+    touch_count_30d,
+    has_checkout_success,
+    has_blog
+  FROM agg
+)
+
+-- Apliquei ORDER BY e LIMIT aqui fora
+SELECT
+  user_id,
+  CASE
+    WHEN LENGTH(seq_raw) > 45000 THEN CONCAT(SUBSTR(seq_raw, 1, 45000), ' …[TRUNCATED]')
+    ELSE seq_raw
+  END AS path_sequence,
+  touch_count_30d,
+  has_checkout_success,
+  has_blog,
+  LENGTH(seq_raw) > 45000 AS sequence_truncated
+FROM seq
+ORDER BY user_id
+LIMIT 1000;
